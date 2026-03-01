@@ -6,12 +6,6 @@
   MIT License
 */
 
-#if !defined(_WIN32) && !defined(_WIN64)
-  #ifndef _GNU_SOURCE
-    #define _GNU_SOURCE 1
-  #endif
-#endif
-
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -25,6 +19,14 @@ extern "C" {
   #define GH_PLATFORM_WINDOWS 1
 #else
   #define GH_PLATFORM_POSIX 1
+#endif
+
+#if GH_PLATFORM_POSIX
+  #if defined(_GNU_SOURCE)
+    #define GH_HAS_GNU_SOURCE 1
+  #else
+    #define GH_HAS_GNU_SOURCE 0
+  #endif
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -210,8 +212,14 @@ GELHOOK_API gh_status gh_iat_hook(const char *module_name, const char *import_dl
 #endif
 
 #if GH_ENABLE_PLT
-#if GH_PLATFORM_POSIX
+#if GH_PLATFORM_POSIX && GH_HAS_GNU_SOURCE
 GELHOOK_API gh_status gh_plt_hook(const char *symbol_name, void *replacement, void **original_out);
+#else
+gh_status gh_plt_hook(const char *symbol_name, void *replacement, void **original_out) {
+  (void)symbol_name; (void)replacement; (void)original_out;
+  gh_set_error(\"plt hook requires _GNU_SOURCE\");
+  return GH_ERR_UNSUPPORTED;
+}
 #endif
 #endif
 
@@ -1168,7 +1176,7 @@ static __thread void *g_gh_pending_bp = NULL;
 static void gh_sigtrap_handler(int sig, siginfo_t *si, void *uctx) {
   (void)sig; (void)si;
   ucontext_t *ctx = (ucontext_t *)uctx;
-#if defined(__x86_64__)
+#if defined(__x86_64__) && GH_HAS_GNU_SOURCE && defined(REG_RIP) && defined(REG_EFL)
   greg_t rip = ctx->uc_mcontext.gregs[REG_RIP];
   if (g_gh_pending_bp) {
     uint8_t *pending = (uint8_t *)g_gh_pending_bp;
@@ -1202,6 +1210,7 @@ static void gh_sigtrap_handler(int sig, siginfo_t *si, void *uctx) {
 }
 
 static void gh_breakpoints_init_handler(void) {
+#if GH_HAS_GNU_SOURCE
   if (g_gh_sig_installed) return;
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
@@ -1209,6 +1218,9 @@ static void gh_breakpoints_init_handler(void) {
   sa.sa_flags = SA_SIGINFO | SA_NODEFER;
   sigaction(SIGTRAP, &sa, NULL);
   g_gh_sig_installed = 1;
+#else
+  (void)g_gh_sig_installed;
+#endif
 }
 
 #endif
@@ -1224,6 +1236,11 @@ gh_status gh_breakpoint_add(gh_breakpoint *bp, void *addr, gh_bp_callback cb, vo
   if (!addr || !cb) return GH_ERR_INVALID_ARG;
 
   gh_breakpoints_init_handler();
+#if GH_PLATFORM_POSIX && !GH_HAS_GNU_SOURCE
+  gh_set_error("breakpoints require _GNU_SOURCE on Linux");
+  (void)bp; (void)user;
+  return GH_ERR_UNSUPPORTED;
+#endif
 
   gh_breakpoint *slot = bp ? bp : gh_breakpoint_find_slot();
   if (!slot) return GH_ERR_STATE;
