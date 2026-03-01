@@ -1,0 +1,13 @@
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.pdb
+*.ilk
+build/
+cmake-build-*/
+.DS_Store
