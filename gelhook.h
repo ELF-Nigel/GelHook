@@ -95,13 +95,16 @@ typedef enum gh_hook_kind {
   GH_HOOK_INLINE = 0,
   GH_HOOK_IAT = 1,
   GH_HOOK_PLT = 2,
-  GH_HOOK_VTABLE = 3
+  GH_HOOK_VTABLE = 3,
+  GH_HOOK_SITE = 4,
+  GH_HOOK_EAT = 5
 } gh_hook_kind;
 
 typedef struct gh_hook_options {
   int prefer_rel_jump;
   int suspend_threads;
   int allocate_near;
+  int allow_code_cave;
   size_t max_stolen;
 } gh_hook_options;
 
@@ -185,6 +188,7 @@ typedef struct gh_hw_breakpoint {
 
 GELHOOK_API gh_status gh_init_hook(gh_hook *hook, void *target, void *replacement);
 GELHOOK_API gh_status gh_init_hook_ex(gh_hook *hook, void *target, void *replacement, const gh_hook_options *options);
+GELHOOK_API gh_status gh_init_hook_at(gh_hook *hook, void *site, void *replacement, size_t patch_size, const gh_hook_options *options);
 GELHOOK_API gh_status gh_enable_hook(gh_hook *hook);
 GELHOOK_API gh_status gh_disable_hook(gh_hook *hook);
 GELHOOK_API gh_status gh_destroy_hook(gh_hook *hook);
@@ -197,10 +201,13 @@ GELHOOK_API gh_status gh_manager_init(gh_hook_manager *mgr, size_t initial_cap);
 GELHOOK_API gh_status gh_manager_add(gh_hook_manager *mgr, const gh_hook *hook);
 GELHOOK_API gh_status gh_manager_enable_all(gh_hook_manager *mgr);
 GELHOOK_API gh_status gh_manager_disable_all(gh_hook_manager *mgr);
+GELHOOK_API gh_status gh_manager_enable_all_atomic(gh_hook_manager *mgr, const gh_hook_options *options);
 GELHOOK_API void gh_manager_destroy(gh_hook_manager *mgr);
 
 #if GH_ENABLE_VTABLE
 GELHOOK_API gh_status gh_vtable_hook(void **vtable, size_t index, void *replacement, void **original_out);
+GELHOOK_API gh_status gh_vtable_swap(void *obj, size_t vtable_count, size_t index,
+                                    void *replacement, void **original_out, void ***new_table_out);
 #endif
 
 #if GH_ENABLE_IAT
@@ -213,6 +220,13 @@ GELHOOK_API gh_status gh_iat_hook(const char *module_name, const char *import_dl
 #if GH_ENABLE_PLT
 GELHOOK_API gh_status gh_plt_hook(const char *symbol_name, void *replacement, void **original_out);
 #endif
+
+#if GH_PLATFORM_WINDOWS
+GELHOOK_API gh_status gh_eat_hook(const char *module_name, const char *export_name,
+                                 void *replacement, void **original_out);
+#endif
+
+GELHOOK_API void *gh_resolve_symbol(const char *module_name, const char *symbol_name);
 
 #if GH_ENABLE_BREAKPOINTS
 GELHOOK_API gh_status gh_breakpoint_add(gh_breakpoint *bp, void *addr, gh_bp_callback cb, void *user);
@@ -319,6 +333,27 @@ static void gh_write_rel_jump(void *at, void *to, unsigned char out[GH_REL_JMP_S
 static int gh_rel32_fits(void *from, void *to, size_t instr_size) {
   intptr_t rel = (intptr_t)((unsigned char *)to - ((unsigned char *)from + instr_size));
   return rel >= INT32_MIN && rel <= INT32_MAX;
+}
+
+static void *gh_find_code_cave(void *near_addr, size_t size) {
+#if GH_PLATFORM_WINDOWS
+  SYSTEM_INFO info;
+  GetSystemInfo(&info);
+  size_t page_size = info.dwPageSize;
+#else
+  long page_size = sysconf(_SC_PAGESIZE);
+#endif
+  uintptr_t start = (uintptr_t)near_addr & ~(uintptr_t)(page_size - 1);
+  uint8_t *p = (uint8_t *)start;
+  for (size_t i = 0; i + size <= (size_t)page_size; ++i) {
+    size_t j = 0;
+    for (; j < size; ++j) {
+      uint8_t b = p[i + j];
+      if (b != 0x90 && b != 0xCC) break;
+    }
+    if (j == size) return p + i;
+  }
+  return NULL;
 }
 
 static gh_status gh_protect_rwxa(void *addr, size_t size, int *old_prot_out) {
@@ -736,10 +771,23 @@ static gh_status gh_build_trampoline(gh_hook *hook, const gh_hook_options *opts)
 
 static gh_status gh_prepare_inline_hook(gh_hook *hook, const gh_hook_options *opts) {
   int use_rel = opts ? opts->prefer_rel_jump : 1;
+  int allow_cave = opts ? opts->allow_code_cave : 0;
+  void *cave = NULL;
+
   if (use_rel && gh_rel32_fits(hook->target, hook->replacement, GH_REL_JMP_SIZE)) {
     hook->patch_size = GH_REL_JMP_SIZE;
   } else {
-    hook->patch_size = GH_ABS_JMP_SIZE;
+    if (allow_cave) {
+      cave = gh_find_code_cave(hook->target, GH_ABS_JMP_SIZE);
+      if (cave && gh_rel32_fits(hook->target, cave, GH_REL_JMP_SIZE)) {
+        hook->patch_size = GH_REL_JMP_SIZE;
+        hook->extra = cave;
+      } else {
+        hook->patch_size = GH_ABS_JMP_SIZE;
+      }
+    } else {
+      hook->patch_size = GH_ABS_JMP_SIZE;
+    }
   }
 
   return gh_build_trampoline(hook, opts);
@@ -764,8 +812,24 @@ gh_status gh_init_hook(gh_hook *hook, void *target, void *replacement) {
   opts.prefer_rel_jump = 1;
   opts.suspend_threads = 1;
   opts.allocate_near = 1;
+  opts.allow_code_cave = 1;
   opts.max_stolen = GH_MAX_STOLEN;
   return gh_init_hook_ex(hook, target, replacement, &opts);
+}
+
+gh_status gh_init_hook_at(gh_hook *hook, void *site, void *replacement, size_t patch_size, const gh_hook_options *options) {
+  if (!hook || !site || !replacement || patch_size == 0) {
+    gh_set_error("invalid args");
+    return GH_ERR_INVALID_ARG;
+  }
+
+  memset(hook, 0, sizeof(*hook));
+  hook->kind = GH_HOOK_SITE;
+  hook->target = site;
+  hook->replacement = replacement;
+  hook->patch_size = patch_size;
+
+  return gh_build_trampoline(hook, options);
 }
 
 static gh_status gh_apply_patch(gh_hook *hook) {
@@ -775,7 +839,17 @@ static gh_status gh_apply_patch(gh_hook *hook) {
 
   if (hook->patch_size == GH_REL_JMP_SIZE) {
     unsigned char patch[GH_REL_JMP_SIZE];
-    gh_write_rel_jump(hook->target, hook->replacement, patch);
+    void *dst = hook->replacement;
+    if (hook->extra) {
+      void *cave = hook->extra;
+      int cave_old = 0;
+      gh_status stc = gh_protect_rwxa(cave, GH_ABS_JMP_SIZE, &cave_old);
+      if (stc != GH_OK) return stc;
+      gh_write_abs_jump(cave, hook->replacement, (unsigned char *)cave);
+      (void)gh_restore_prot(cave, GH_ABS_JMP_SIZE, cave_old);
+      dst = cave;
+    }
+    gh_write_rel_jump(hook->target, dst, patch);
     memcpy(hook->target, patch, GH_REL_JMP_SIZE);
   } else {
     unsigned char patch[GH_ABS_JMP_SIZE];
@@ -803,6 +877,7 @@ gh_status gh_enable_hook(gh_hook *hook) {
   opts.prefer_rel_jump = 1;
   opts.suspend_threads = 1;
   opts.allocate_near = 1;
+  opts.allow_code_cave = 1;
   opts.max_stolen = GH_MAX_STOLEN;
 
   gh_threads_suspend_if_enabled(&opts);
@@ -820,7 +895,8 @@ gh_status gh_rehook(gh_hook *hook) {
 
   if (hook->patch_size == GH_REL_JMP_SIZE) {
     unsigned char expected[GH_REL_JMP_SIZE];
-    gh_write_rel_jump(hook->target, hook->replacement, expected);
+    void *dst = hook->extra ? hook->extra : hook->replacement;
+    gh_write_rel_jump(hook->target, dst, expected);
     if (memcmp(hook->target, expected, GH_REL_JMP_SIZE) == 0) return GH_OK;
   } else {
     unsigned char expected[GH_ABS_JMP_SIZE];
@@ -917,6 +993,25 @@ gh_status gh_manager_disable_all(gh_hook_manager *mgr) {
   return GH_OK;
 }
 
+gh_status gh_manager_enable_all_atomic(gh_hook_manager *mgr, const gh_hook_options *options) {
+  if (!mgr) return GH_ERR_INVALID_ARG;
+
+  gh_threads_suspend_if_enabled(options);
+  for (size_t i = 0; i < mgr->count; ++i) {
+    gh_status st = gh_apply_patch(&mgr->hooks[i]);
+    if (st != GH_OK) {
+      for (size_t j = 0; j < i; ++j) {
+        (void)gh_disable_hook(&mgr->hooks[j]);
+      }
+      gh_threads_resume_if_enabled(options);
+      return st;
+    }
+    mgr->hooks[i].enabled = 1;
+  }
+  gh_threads_resume_if_enabled(options);
+  return GH_OK;
+}
+
 void gh_manager_destroy(gh_hook_manager *mgr) {
   if (!mgr) return;
   free(mgr->hooks);
@@ -940,6 +1035,27 @@ gh_status gh_vtable_hook(void **vtable, size_t index, void *replacement, void **
   st = gh_restore_prot(&vtable[index], sizeof(void *), old_prot);
   if (st != GH_OK) return st;
 
+  return GH_OK;
+}
+
+gh_status gh_vtable_swap(void *obj, size_t vtable_count, size_t index,
+                         void *replacement, void **original_out, void ***new_table_out) {
+  if (!obj || !replacement || vtable_count == 0 || index >= vtable_count) return GH_ERR_INVALID_ARG;
+
+  void ***obj_vptr = (void ***)obj;
+  void **old_table = *obj_vptr;
+  if (!old_table) return GH_ERR_INVALID_ARG;
+
+  void **new_table = (void **)malloc(sizeof(void *) * vtable_count);
+  if (!new_table) return GH_ERR_ALLOC;
+
+  memcpy(new_table, old_table, sizeof(void *) * vtable_count);
+  if (original_out) *original_out = old_table[index];
+  new_table[index] = replacement;
+
+  *obj_vptr = new_table;
+
+  if (new_table_out) *new_table_out = new_table;
   return GH_OK;
 }
 
@@ -990,6 +1106,64 @@ gh_status gh_iat_hook(const char *module_name, const char *import_dll,
 
   return GH_ERR_NOT_FOUND;
 }
+
+#if GH_PLATFORM_WINDOWS
+gh_status gh_eat_hook(const char *module_name, const char *export_name,
+                      void *replacement, void **original_out) {
+  if (!export_name || !replacement) return GH_ERR_INVALID_ARG;
+
+  HMODULE hmod = module_name ? GetModuleHandleA(module_name) : GetModuleHandleA(NULL);
+  if (!hmod) return GH_ERR_NOT_FOUND;
+
+  ULONG size = 0;
+  PIMAGE_EXPORT_DIRECTORY exp = (PIMAGE_EXPORT_DIRECTORY)ImageDirectoryEntryToData(
+      hmod, TRUE, IMAGE_DIRECTORY_ENTRY_EXPORT, &size);
+  if (!exp) return GH_ERR_NOT_FOUND;
+
+  DWORD *names = (DWORD *)((uint8_t *)hmod + exp->AddressOfNames);
+  WORD *ords = (WORD *)((uint8_t *)hmod + exp->AddressOfNameOrdinals);
+  DWORD *funcs = (DWORD *)((uint8_t *)hmod + exp->AddressOfFunctions);
+
+  for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
+    const char *name = (const char *)((uint8_t *)hmod + names[i]);
+    if (strcmp(name, export_name) != 0) continue;
+
+    WORD ord = ords[i];
+    DWORD *func_rva = &funcs[ord];
+    void *orig = (uint8_t *)hmod + *func_rva;
+    if (original_out) *original_out = orig;
+
+    uintptr_t base = (uintptr_t)hmod;
+    uintptr_t rep = (uintptr_t)replacement;
+    DWORD new_rva = 0;
+    if (rep >= base && (rep - base) <= 0xFFFFFFFFu) {
+      new_rva = (DWORD)(rep - base);
+    } else {
+      void *stub = VirtualAlloc(NULL, GH_ABS_JMP_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+      if (!stub) return GH_ERR_ALLOC;
+      if (((uintptr_t)stub - base) > 0xFFFFFFFFu) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        return GH_ERR_RANGE;
+      }
+      gh_write_abs_jump(stub, replacement, (unsigned char *)stub);
+      new_rva = (DWORD)((uintptr_t)stub - base);
+    }
+
+    int old_prot = 0;
+    gh_status st = gh_protect_rwxa(func_rva, sizeof(DWORD), &old_prot);
+    if (st != GH_OK) return st;
+
+    *func_rva = new_rva;
+
+    st = gh_restore_prot(func_rva, sizeof(DWORD), old_prot);
+    if (st != GH_OK) return st;
+
+    return GH_OK;
+  }
+
+  return GH_ERR_NOT_FOUND;
+}
+#endif
 
 #endif
 #endif
@@ -1386,6 +1560,26 @@ gh_status gh_hw_breakpoint_remove(gh_hw_breakpoint *bp) {
 
 #endif
 #endif
+
+void *gh_resolve_symbol(const char *module_name, const char *symbol_name) {
+  if (!symbol_name) return NULL;
+#if GH_PLATFORM_WINDOWS
+  HMODULE hmod = module_name ? GetModuleHandleA(module_name) : GetModuleHandleA(NULL);
+  if (!hmod && module_name) hmod = LoadLibraryA(module_name);
+  if (!hmod) return NULL;
+  return (void *)GetProcAddress(hmod, symbol_name);
+#else
+  void *handle = RTLD_DEFAULT;
+#ifdef RTLD_NOLOAD
+  if (module_name) handle = dlopen(module_name, RTLD_LAZY | RTLD_NOLOAD);
+#endif
+  if (!handle && module_name) handle = dlopen(module_name, RTLD_LAZY);
+  if (!handle) handle = RTLD_DEFAULT;
+  void *sym = dlsym(handle, symbol_name);
+  if (module_name && handle && handle != RTLD_DEFAULT) dlclose(handle);
+  return sym;
+#endif
+}
 
 #endif
 
