@@ -11,8 +11,9 @@ GelHook is a single-header, advanced user-mode hook library written in pure C fo
 - Windows IAT hooks + Linux PLT/GOT hooks
 - VTable/VFunc pointer swaps
 - User-mode software breakpoint hooks
+- User-mode hardware breakpoint hooks (Windows, per-thread)
 - Hook manager API (batch enable/disable)
-- Optional external disassembler backend via a small decoder interface
+- Optional external disassembler backend via a small decoder interface (templates for Capstone/Zydis)
 
 ## Status
 
@@ -30,8 +31,16 @@ cmake --build build --config Release
 - `examples/basic.c` inline detour
 - `examples/breakpoint.c` software breakpoint hook
 - `examples/iat.c` IAT hook (Windows)
+- `examples/hw_breakpoint.c` hardware breakpoint hook (Windows)
 - `examples/plt.c` PLT/GOT hook (Linux)
 - `examples/vtable.cpp` vtable swap (C++)
+- `examples/rehook.c` rehook stress test
+- `examples/python/` Python ctypes demo
+
+## Extras
+
+- `extras/decoder_capstone.c` adapter template (requires Capstone)
+- `extras/decoder_zydis.c` adapter template (requires Zydis)
 
 ## Usage
 

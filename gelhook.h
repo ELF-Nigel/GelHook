@@ -39,6 +39,10 @@ extern "C" {
   #define GH_MAX_BREAKPOINTS 64
 #endif
 
+#ifndef GH_MAX_HW_BREAKPOINTS
+  #define GH_MAX_HW_BREAKPOINTS 4
+#endif
+
 #ifndef GH_ENABLE_IAT
   #define GH_ENABLE_IAT 1
 #endif
@@ -53,6 +57,10 @@ extern "C" {
 
 #ifndef GH_ENABLE_BREAKPOINTS
   #define GH_ENABLE_BREAKPOINTS 1
+#endif
+
+#ifndef GH_ENABLE_HW_BREAKPOINTS
+  #define GH_ENABLE_HW_BREAKPOINTS 1
 #endif
 
 #ifndef GH_ENABLE_THREAD_SUSPEND
@@ -155,6 +163,17 @@ typedef struct gh_breakpoint {
   int enabled;
 } gh_breakpoint;
 
+#if GH_ENABLE_HW_BREAKPOINTS
+typedef struct gh_hw_breakpoint {
+  void *addr;
+  void *thread;
+  gh_bp_callback callback;
+  void *user;
+  int enabled;
+  int slot;
+} gh_hw_breakpoint;
+#endif
+
 #endif
 
 GELHOOK_API gh_status gh_init_hook(gh_hook *hook, void *target, void *replacement);
@@ -193,6 +212,12 @@ GELHOOK_API gh_status gh_plt_hook(const char *symbol_name, void *replacement, vo
 #if GH_ENABLE_BREAKPOINTS
 GELHOOK_API gh_status gh_breakpoint_add(gh_breakpoint *bp, void *addr, gh_bp_callback cb, void *user);
 GELHOOK_API gh_status gh_breakpoint_remove(gh_breakpoint *bp);
+#if GH_ENABLE_HW_BREAKPOINTS
+#if GH_PLATFORM_WINDOWS
+GELHOOK_API gh_status gh_hw_breakpoint_add(gh_hw_breakpoint *bp, void *addr, void *thread, gh_bp_callback cb, void *user);
+GELHOOK_API gh_status gh_hw_breakpoint_remove(gh_hw_breakpoint *bp);
+#endif
+#endif
 #endif
 
 GELHOOK_API void gh_set_thread_callbacks(const gh_thread_callbacks *cbs);
@@ -1053,6 +1078,9 @@ static gh_breakpoint g_gh_breakpoints[GH_MAX_BREAKPOINTS];
 #if GH_PLATFORM_WINDOWS
 static PVOID g_gh_veh = NULL;
 static DWORD g_gh_tls_idx = TLS_OUT_OF_INDEXES;
+#if GH_ENABLE_HW_BREAKPOINTS
+static gh_hw_breakpoint g_gh_hw_breakpoints[GH_MAX_HW_BREAKPOINTS];
+#endif
 
 static LONG CALLBACK gh_veh_handler(PEXCEPTION_POINTERS info) {
   if (!info || !info->ExceptionRecord || !info->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
@@ -1095,6 +1123,24 @@ static LONG CALLBACK gh_veh_handler(PEXCEPTION_POINTERS info) {
         return EXCEPTION_CONTINUE_EXECUTION;
       }
     }
+#if GH_ENABLE_HW_BREAKPOINTS
+    DWORD tid = GetCurrentThreadId();
+    DWORD64 dr6 = info->ContextRecord->Dr6;
+    if (dr6) {
+      for (size_t i = 0; i < GH_MAX_HW_BREAKPOINTS; ++i) {
+        if (g_gh_hw_breakpoints[i].enabled &&
+            g_gh_hw_breakpoints[i].thread == (void *)(uintptr_t)tid) {
+          uint8_t *ip = (uint8_t *)info->ContextRecord->Rip;
+          if (g_gh_hw_breakpoints[i].addr == ip) {
+            if (g_gh_hw_breakpoints[i].callback) {
+              g_gh_hw_breakpoints[i].callback(ip, g_gh_hw_breakpoints[i].user);
+            }
+            return EXCEPTION_CONTINUE_EXECUTION;
+          }
+        }
+      }
+    }
+#endif
   }
 
   return EXCEPTION_CONTINUE_SEARCH;
@@ -1205,6 +1251,117 @@ gh_status gh_breakpoint_remove(gh_breakpoint *bp) {
   bp->enabled = 0;
   return GH_OK;
 }
+
+#if GH_ENABLE_HW_BREAKPOINTS
+#if GH_PLATFORM_WINDOWS
+
+static gh_hw_breakpoint *gh_hw_breakpoint_find_slot(void) {
+  for (size_t i = 0; i < GH_MAX_HW_BREAKPOINTS; ++i) {
+    if (!g_gh_hw_breakpoints[i].enabled) return &g_gh_hw_breakpoints[i];
+  }
+  return NULL;
+}
+
+static void gh_hw_set_dr(CONTEXT *ctx, int slot, void *addr) {
+  switch (slot) {
+    case 0: ctx->Dr0 = (DWORD64)(uintptr_t)addr; break;
+    case 1: ctx->Dr1 = (DWORD64)(uintptr_t)addr; break;
+    case 2: ctx->Dr2 = (DWORD64)(uintptr_t)addr; break;
+    case 3: ctx->Dr3 = (DWORD64)(uintptr_t)addr; break;
+    default: break;
+  }
+}
+
+static void gh_hw_enable_slot(CONTEXT *ctx, int slot, int enable) {
+  if (enable) {
+    ctx->Dr7 |= (1ull << (slot * 2));
+    ctx->Dr7 &= ~(3ull << (16 + slot * 4)); /* exec */
+    ctx->Dr7 &= ~(3ull << (18 + slot * 4)); /* len */
+  } else {
+    ctx->Dr7 &= ~(1ull << (slot * 2));
+  }
+}
+
+gh_status gh_hw_breakpoint_add(gh_hw_breakpoint *bp, void *addr, void *thread, gh_bp_callback cb, void *user) {
+  if (!addr || !thread || !cb) return GH_ERR_INVALID_ARG;
+
+  gh_breakpoints_init_handler();
+
+  gh_hw_breakpoint *slot = bp ? bp : gh_hw_breakpoint_find_slot();
+  if (!slot) return GH_ERR_STATE;
+
+  DWORD tid = GetThreadId((HANDLE)thread);
+  if (!tid) return GH_ERR_INVALID_ARG;
+
+  int index = (int)(slot - g_gh_hw_breakpoints);
+  CONTEXT ctx;
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+  SuspendThread((HANDLE)thread);
+  if (!GetThreadContext((HANDLE)thread, &ctx)) {
+    ResumeThread((HANDLE)thread);
+    return GH_ERR_STATE;
+  }
+
+  gh_hw_set_dr(&ctx, index, addr);
+  gh_hw_enable_slot(&ctx, index, 1);
+  ctx.Dr6 = 0;
+
+  if (!SetThreadContext((HANDLE)thread, &ctx)) {
+    ResumeThread((HANDLE)thread);
+    return GH_ERR_STATE;
+  }
+
+  ResumeThread((HANDLE)thread);
+
+  slot->addr = addr;
+  slot->thread = (void *)(uintptr_t)tid;
+  slot->callback = cb;
+  slot->user = user;
+  slot->enabled = 1;
+  slot->slot = index;
+
+  return GH_OK;
+}
+
+gh_status gh_hw_breakpoint_remove(gh_hw_breakpoint *bp) {
+  if (!bp || !bp->enabled || !bp->thread) return GH_ERR_INVALID_ARG;
+
+  DWORD tid = (DWORD)(uintptr_t)bp->thread;
+  HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+  if (!thread) return GH_ERR_STATE;
+
+  CONTEXT ctx;
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+  SuspendThread(thread);
+  if (!GetThreadContext(thread, &ctx)) {
+    ResumeThread(thread);
+    CloseHandle(thread);
+    return GH_ERR_STATE;
+  }
+
+  gh_hw_set_dr(&ctx, bp->slot, NULL);
+  gh_hw_enable_slot(&ctx, bp->slot, 0);
+  ctx.Dr6 = 0;
+
+  if (!SetThreadContext(thread, &ctx)) {
+    ResumeThread(thread);
+    CloseHandle(thread);
+    return GH_ERR_STATE;
+  }
+
+  ResumeThread(thread);
+  CloseHandle(thread);
+
+  bp->enabled = 0;
+  return GH_OK;
+}
+
+#endif
+#endif
 
 #endif
 
