@@ -212,15 +212,7 @@ GELHOOK_API gh_status gh_iat_hook(const char *module_name, const char *import_dl
 #endif
 
 #if GH_ENABLE_PLT
-#if GH_PLATFORM_POSIX && GH_HAS_GNU_SOURCE
 GELHOOK_API gh_status gh_plt_hook(const char *symbol_name, void *replacement, void **original_out);
-#else
-gh_status gh_plt_hook(const char *symbol_name, void *replacement, void **original_out) {
-  (void)symbol_name; (void)replacement; (void)original_out;
-  gh_set_error(\"plt hook requires _GNU_SOURCE\");
-  return GH_ERR_UNSUPPORTED;
-}
-#endif
 #endif
 
 #if GH_ENABLE_BREAKPOINTS
@@ -1006,7 +998,7 @@ gh_status gh_iat_hook(const char *module_name, const char *import_dll,
 /* ---------------- POSIX PLT/GOT hook ---------------- */
 
 #if GH_ENABLE_PLT
-#if GH_PLATFORM_POSIX
+#if GH_PLATFORM_POSIX && GH_HAS_GNU_SOURCE
 
 typedef struct gh_plt_find_ctx {
   const char *symbol;
@@ -1082,6 +1074,14 @@ gh_status gh_plt_hook(const char *symbol_name, void *replacement, void **origina
   dl_iterate_phdr(gh_plt_iterate, &ctx);
   return ctx.found ? GH_OK : GH_ERR_NOT_FOUND;
 }
+
+#else
+gh_status gh_plt_hook(const char *symbol_name, void *replacement, void **original_out) {
+  (void)symbol_name; (void)replacement; (void)original_out;
+  gh_set_error("plt hook requires _GNU_SOURCE");
+  return GH_ERR_UNSUPPORTED;
+}
+#endif
 
 #endif
 #endif
