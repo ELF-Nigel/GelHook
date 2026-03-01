@@ -9,11 +9,13 @@ GelHook is a single-header, advanced user-mode hook library written in pure C fo
 - Relative and absolute jump patches with near-trampoline allocation
 - Optional code-cave detours (5-byte patch to a nearby cave)
 - Rehook support (repair overwritten detours)
-- Windows IAT/EAT hooks + Linux PLT/GOT hooks
+- Windows IAT/EAT hooks + delay-load IAT + Linux PLT/GOT hooks
+- Module-scoped IAT/EAT utilities and export forwarder resolution
 - VTable/VFunc pointer swaps + deep-copy VTable swap
 - Mid-function/site hooks (patch arbitrary address)
 - User-mode software breakpoint hooks
 - User-mode hardware breakpoint hooks (Windows, per-thread)
+- Guard-page hooks (Windows)
 - Hook manager API (batch enable/disable)
 - Optional external disassembler backend via a small decoder interface (templates for Capstone/Zydis)
 
@@ -35,6 +37,7 @@ cmake --build build --config Release
 - `examples/iat.c` IAT hook (Windows)
 - `examples/eat.c` EAT hook (Windows)
 - `examples/hw_breakpoint.c` hardware breakpoint hook (Windows)
+- `examples/guard_page.c` guard-page hook (Windows)
 - `examples/plt.c` PLT/GOT hook (Linux)
 - `examples/vtable.cpp` vtable swap (C++)
 - `examples/vtable_swap.cpp` deep-copy vtable swap (C++)

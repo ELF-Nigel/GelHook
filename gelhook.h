@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -173,6 +174,17 @@ typedef struct gh_breakpoint {
   int enabled;
 } gh_breakpoint;
 
+#if GH_PLATFORM_WINDOWS
+typedef void (*gh_guard_callback)(void *ip, void *user);
+typedef struct gh_guard_hook {
+  void *addr;
+  size_t size;
+  gh_guard_callback callback;
+  void *user;
+  int enabled;
+} gh_guard_hook;
+#endif
+
 #if GH_ENABLE_HW_BREAKPOINTS
 typedef struct gh_hw_breakpoint {
   void *addr;
@@ -224,6 +236,16 @@ GELHOOK_API gh_status gh_plt_hook(const char *symbol_name, void *replacement, vo
 #if GH_PLATFORM_WINDOWS
 GELHOOK_API gh_status gh_eat_hook(const char *module_name, const char *export_name,
                                  void *replacement, void **original_out);
+GELHOOK_API gh_status gh_iat_hook_module(void *module_base, const char *import_dll,
+                                         const char *func_name, void *replacement, void **original_out);
+GELHOOK_API gh_status gh_iat_hook_all(const char *import_dll, const char *func_name,
+                                      void *replacement, void **original_out);
+GELHOOK_API gh_status gh_delay_iat_hook(const char *module_name, const char *import_dll,
+                                        const char *func_name, void *replacement, void **original_out);
+GELHOOK_API gh_status gh_eat_hook_module(void *module_base, const char *export_name,
+                                         void *replacement, void **original_out);
+GELHOOK_API void *gh_resolve_export_forwarder(void *module_base, const char *export_name);
+GELHOOK_API void *gh_resolve_export_by_ordinal(void *module_base, uint16_t ordinal);
 #endif
 
 GELHOOK_API void *gh_resolve_symbol(const char *module_name, const char *symbol_name);
@@ -231,6 +253,10 @@ GELHOOK_API void *gh_resolve_symbol(const char *module_name, const char *symbol_
 #if GH_ENABLE_BREAKPOINTS
 GELHOOK_API gh_status gh_breakpoint_add(gh_breakpoint *bp, void *addr, gh_bp_callback cb, void *user);
 GELHOOK_API gh_status gh_breakpoint_remove(gh_breakpoint *bp);
+#if GH_PLATFORM_WINDOWS
+GELHOOK_API gh_status gh_guard_hook_add(gh_guard_hook *hook, void *addr, size_t size, gh_guard_callback cb, void *user);
+GELHOOK_API gh_status gh_guard_hook_remove(gh_guard_hook *hook);
+#endif
 #if GH_ENABLE_HW_BREAKPOINTS
 #if GH_PLATFORM_WINDOWS
 GELHOOK_API gh_status gh_hw_breakpoint_add(gh_hw_breakpoint *bp, void *addr, void *thread, gh_bp_callback cb, void *user);
@@ -253,6 +279,7 @@ GELHOOK_API void gh_set_thread_callbacks(const gh_thread_callbacks *cbs);
   #include <tlhelp32.h>
   #include <psapi.h>
   #include <dbghelp.h>
+  #include <delayimp.h>
 #else
   #include <sys/mman.h>
   #include <unistd.h>
@@ -1066,12 +1093,9 @@ gh_status gh_vtable_swap(void *obj, size_t vtable_count, size_t index,
 #if GH_ENABLE_IAT
 #if GH_PLATFORM_WINDOWS
 
-gh_status gh_iat_hook(const char *module_name, const char *import_dll,
-                      const char *func_name, void *replacement, void **original_out) {
-  if (!import_dll || !func_name || !replacement) return GH_ERR_INVALID_ARG;
-
-  HMODULE hmod = module_name ? GetModuleHandleA(module_name) : GetModuleHandleA(NULL);
-  if (!hmod) return GH_ERR_NOT_FOUND;
+static gh_status gh_iat_hook_module_internal(HMODULE hmod, const char *import_dll,
+                                             const char *func_name, void *replacement, void **original_out) {
+  if (!hmod || !import_dll || !func_name || !replacement) return GH_ERR_INVALID_ARG;
 
   ULONG size = 0;
   PIMAGE_IMPORT_DESCRIPTOR desc = (PIMAGE_IMPORT_DESCRIPTOR)ImageDirectoryEntryToData(
@@ -1105,6 +1129,36 @@ gh_status gh_iat_hook(const char *module_name, const char *import_dll,
   }
 
   return GH_ERR_NOT_FOUND;
+}
+
+gh_status gh_iat_hook(const char *module_name, const char *import_dll,
+                      const char *func_name, void *replacement, void **original_out) {
+  HMODULE hmod = module_name ? GetModuleHandleA(module_name) : GetModuleHandleA(NULL);
+  if (!hmod) return GH_ERR_NOT_FOUND;
+  return gh_iat_hook_module_internal(hmod, import_dll, func_name, replacement, original_out);
+}
+
+gh_status gh_iat_hook_module(void *module_base, const char *import_dll,
+                             const char *func_name, void *replacement, void **original_out) {
+  return gh_iat_hook_module_internal((HMODULE)module_base, import_dll, func_name, replacement, original_out);
+}
+
+gh_status gh_iat_hook_all(const char *import_dll, const char *func_name,
+                          void *replacement, void **original_out) {
+  if (!import_dll || !func_name || !replacement) return GH_ERR_INVALID_ARG;
+
+  HMODULE modules[512];
+  DWORD needed = 0;
+  if (!EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed)) {
+    return GH_ERR_STATE;
+  }
+  size_t count = needed / sizeof(HMODULE);
+  for (size_t i = 0; i < count; ++i) {
+    gh_status st = gh_iat_hook_module_internal(modules[i], import_dll, func_name, replacement, original_out);
+    if (st == GH_OK) return GH_OK;
+  }
+  return GH_ERR_NOT_FOUND;
+}
 }
 
 #if GH_PLATFORM_WINDOWS
@@ -1164,6 +1218,171 @@ gh_status gh_eat_hook(const char *module_name, const char *export_name,
   return GH_ERR_NOT_FOUND;
 }
 #endif
+
+void *gh_resolve_export_by_ordinal(void *module_base, uint16_t ordinal) {
+  if (!module_base) return NULL;
+  HMODULE hmod = (HMODULE)module_base;
+  ULONG size = 0;
+  PIMAGE_EXPORT_DIRECTORY exp = (PIMAGE_EXPORT_DIRECTORY)ImageDirectoryEntryToData(
+      hmod, TRUE, IMAGE_DIRECTORY_ENTRY_EXPORT, &size);
+  if (!exp) return NULL;
+
+  DWORD base = exp->Base;
+  if (ordinal < base || ordinal >= base + exp->NumberOfFunctions) return NULL;
+
+  DWORD *funcs = (DWORD *)((uint8_t *)hmod + exp->AddressOfFunctions);
+  DWORD rva = funcs[ordinal - base];
+  return (void *)((uint8_t *)hmod + rva);
+}
+
+void *gh_resolve_export_forwarder(void *module_base, const char *export_name) {
+  if (!module_base || !export_name) return NULL;
+  HMODULE hmod = (HMODULE)module_base;
+  ULONG size = 0;
+  PIMAGE_EXPORT_DIRECTORY exp = (PIMAGE_EXPORT_DIRECTORY)ImageDirectoryEntryToData(
+      hmod, TRUE, IMAGE_DIRECTORY_ENTRY_EXPORT, &size);
+  if (!exp) return NULL;
+
+  DWORD *names = (DWORD *)((uint8_t *)hmod + exp->AddressOfNames);
+  WORD *ords = (WORD *)((uint8_t *)hmod + exp->AddressOfNameOrdinals);
+  DWORD *funcs = (DWORD *)((uint8_t *)hmod + exp->AddressOfFunctions);
+
+  for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
+    const char *name = (const char *)((uint8_t *)hmod + names[i]);
+    if (strcmp(name, export_name) != 0) continue;
+
+    WORD ord = ords[i];
+    DWORD rva = funcs[ord];
+    uint8_t *addr = (uint8_t *)hmod + rva;
+
+    uint8_t *exp_start = (uint8_t *)exp;
+    uint8_t *exp_end = exp_start + size;
+    if (addr >= exp_start && addr < exp_end) {
+      const char *fwd = (const char *)addr;
+      const char *dot = strchr(fwd, '.');
+      if (!dot) return NULL;
+
+      char dll[128];
+      size_t n = (size_t)(dot - fwd);
+      if (n >= sizeof(dll)) return NULL;
+      memcpy(dll, fwd, n);
+      dll[n] = '\0';
+
+      char dllname[160];
+      snprintf(dllname, sizeof(dllname), "%s.dll", dll);
+
+      HMODULE fh = GetModuleHandleA(dllname);
+      if (!fh) fh = LoadLibraryA(dllname);
+      if (!fh) return NULL;
+
+      const char *sym = dot + 1;
+      if (sym[0] == '#') {
+        uint16_t ord2 = (uint16_t)atoi(sym + 1);
+        return gh_resolve_export_by_ordinal(fh, ord2);
+      }
+      return (void *)GetProcAddress(fh, sym);
+    }
+
+    return addr;
+  }
+
+  return NULL;
+}
+
+gh_status gh_delay_iat_hook(const char *module_name, const char *import_dll,
+                            const char *func_name, void *replacement, void **original_out) {
+  if (!import_dll || !func_name || !replacement) return GH_ERR_INVALID_ARG;
+
+  HMODULE hmod = module_name ? GetModuleHandleA(module_name) : GetModuleHandleA(NULL);
+  if (!hmod) return GH_ERR_NOT_FOUND;
+
+  ULONG size = 0;
+  PIMAGE_DELAYLOAD_DESCRIPTOR desc = (PIMAGE_DELAYLOAD_DESCRIPTOR)ImageDirectoryEntryToData(
+      hmod, TRUE, IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT, &size);
+  if (!desc) return GH_ERR_NOT_FOUND;
+
+  for (; desc->DllNameRVA; ++desc) {
+    const char *dll = (const char *)((uint8_t *)hmod + desc->DllNameRVA);
+    if (_stricmp(dll, import_dll) != 0) continue;
+
+    PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)((uint8_t *)hmod + desc->ImportAddressTableRVA);
+    PIMAGE_THUNK_DATA orig = (PIMAGE_THUNK_DATA)((uint8_t *)hmod + desc->ImportNameTableRVA);
+    for (; orig->u1.AddressOfData; ++orig, ++thunk) {
+      if (orig->u1.Ordinal & IMAGE_ORDINAL_FLAG) continue;
+      PIMAGE_IMPORT_BY_NAME ibn = (PIMAGE_IMPORT_BY_NAME)((uint8_t *)hmod + orig->u1.AddressOfData);
+      if (strcmp((char *)ibn->Name, func_name) != 0) continue;
+
+      if (original_out) *original_out = (void *)thunk->u1.Function;
+
+      int old_prot = 0;
+      gh_status st = gh_protect_rwxa(&thunk->u1.Function, sizeof(void *), &old_prot);
+      if (st != GH_OK) return st;
+
+      thunk->u1.Function = (uintptr_t)replacement;
+
+      st = gh_restore_prot(&thunk->u1.Function, sizeof(void *), old_prot);
+      if (st != GH_OK) return st;
+
+      return GH_OK;
+    }
+  }
+
+  return GH_ERR_NOT_FOUND;
+}
+
+gh_status gh_eat_hook_module(void *module_base, const char *export_name,
+                             void *replacement, void **original_out) {
+  HMODULE hmod = (HMODULE)module_base;
+  if (!hmod || !export_name || !replacement) return GH_ERR_INVALID_ARG;
+
+  ULONG size = 0;
+  PIMAGE_EXPORT_DIRECTORY exp = (PIMAGE_EXPORT_DIRECTORY)ImageDirectoryEntryToData(
+      hmod, TRUE, IMAGE_DIRECTORY_ENTRY_EXPORT, &size);
+  if (!exp) return GH_ERR_NOT_FOUND;
+
+  DWORD *names = (DWORD *)((uint8_t *)hmod + exp->AddressOfNames);
+  WORD *ords = (WORD *)((uint8_t *)hmod + exp->AddressOfNameOrdinals);
+  DWORD *funcs = (DWORD *)((uint8_t *)hmod + exp->AddressOfFunctions);
+
+  for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
+    const char *name = (const char *)((uint8_t *)hmod + names[i]);
+    if (strcmp(name, export_name) != 0) continue;
+
+    WORD ord = ords[i];
+    DWORD *func_rva = &funcs[ord];
+    void *orig = (uint8_t *)hmod + *func_rva;
+    if (original_out) *original_out = orig;
+
+    uintptr_t base = (uintptr_t)hmod;
+    uintptr_t rep = (uintptr_t)replacement;
+    DWORD new_rva = 0;
+    if (rep >= base && (rep - base) <= 0xFFFFFFFFu) {
+      new_rva = (DWORD)(rep - base);
+    } else {
+      void *stub = VirtualAlloc(NULL, GH_ABS_JMP_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+      if (!stub) return GH_ERR_ALLOC;
+      if (((uintptr_t)stub - base) > 0xFFFFFFFFu) {
+        VirtualFree(stub, 0, MEM_RELEASE);
+        return GH_ERR_RANGE;
+      }
+      gh_write_abs_jump(stub, replacement, (unsigned char *)stub);
+      new_rva = (DWORD)((uintptr_t)stub - base);
+    }
+
+    int old_prot = 0;
+    gh_status st = gh_protect_rwxa(func_rva, sizeof(DWORD), &old_prot);
+    if (st != GH_OK) return st;
+
+    *func_rva = new_rva;
+
+    st = gh_restore_prot(func_rva, sizeof(DWORD), old_prot);
+    if (st != GH_OK) return st;
+
+    return GH_OK;
+  }
+
+  return GH_ERR_NOT_FOUND;
+}
 
 #endif
 #endif
@@ -1270,6 +1489,8 @@ static DWORD g_gh_tls_idx = TLS_OUT_OF_INDEXES;
 #if GH_ENABLE_HW_BREAKPOINTS
 static gh_hw_breakpoint g_gh_hw_breakpoints[GH_MAX_HW_BREAKPOINTS];
 #endif
+static gh_guard_hook g_gh_guard_hooks[GH_MAX_BREAKPOINTS];
+static DWORD g_gh_guard_tls_idx = TLS_OUT_OF_INDEXES;
 
 static LONG CALLBACK gh_veh_handler(PEXCEPTION_POINTERS info) {
   if (!info || !info->ExceptionRecord || !info->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
@@ -1300,6 +1521,26 @@ static LONG CALLBACK gh_veh_handler(PEXCEPTION_POINTERS info) {
     }
   }
 
+  if (info->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
+    uint8_t *ip = (uint8_t *)info->ContextRecord->Rip;
+    for (size_t i = 0; i < GH_MAX_BREAKPOINTS; ++i) {
+      if (g_gh_guard_hooks[i].enabled) {
+        uint8_t *base = (uint8_t *)g_gh_guard_hooks[i].addr;
+        uint8_t *end = base + g_gh_guard_hooks[i].size;
+        if (ip >= base && ip < end) {
+          if (g_gh_guard_hooks[i].callback) {
+            g_gh_guard_hooks[i].callback(ip, g_gh_guard_hooks[i].user);
+          }
+          info->ContextRecord->EFlags |= 0x100;
+          if (g_gh_guard_tls_idx != TLS_OUT_OF_INDEXES) {
+            TlsSetValue(g_gh_guard_tls_idx, base);
+          }
+          return EXCEPTION_CONTINUE_EXECUTION;
+        }
+      }
+    }
+  }
+
   if (info->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {
     if (g_gh_tls_idx != TLS_OUT_OF_INDEXES) {
       uint8_t *pending = (uint8_t *)TlsGetValue(g_gh_tls_idx);
@@ -1312,6 +1553,20 @@ static LONG CALLBACK gh_veh_handler(PEXCEPTION_POINTERS info) {
         return EXCEPTION_CONTINUE_EXECUTION;
       }
     }
+#if GH_PLATFORM_WINDOWS
+    if (g_gh_guard_tls_idx != TLS_OUT_OF_INDEXES) {
+      uint8_t *pending = (uint8_t *)TlsGetValue(g_gh_guard_tls_idx);
+      if (pending) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(pending, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+          DWORD oldp = 0;
+          VirtualProtect(mbi.BaseAddress, mbi.RegionSize, mbi.Protect | PAGE_GUARD, &oldp);
+        }
+        TlsSetValue(g_gh_guard_tls_idx, NULL);
+        return EXCEPTION_CONTINUE_EXECUTION;
+      }
+    }
+#endif
 #if GH_ENABLE_HW_BREAKPOINTS
     DWORD tid = GetCurrentThreadId();
     DWORD64 dr6 = info->ContextRecord->Dr6;
@@ -1338,6 +1593,7 @@ static LONG CALLBACK gh_veh_handler(PEXCEPTION_POINTERS info) {
 static void gh_breakpoints_init_handler(void) {
   if (!g_gh_veh) g_gh_veh = AddVectoredExceptionHandler(1, gh_veh_handler);
   if (g_gh_tls_idx == TLS_OUT_OF_INDEXES) g_gh_tls_idx = TlsAlloc();
+  if (g_gh_guard_tls_idx == TLS_OUT_OF_INDEXES) g_gh_guard_tls_idx = TlsAlloc();
 }
 
 #elif GH_PLATFORM_POSIX
@@ -1449,6 +1705,51 @@ gh_status gh_breakpoint_remove(gh_breakpoint *bp) {
   bp->enabled = 0;
   return GH_OK;
 }
+
+#if GH_PLATFORM_WINDOWS
+static gh_guard_hook *gh_guard_hook_find_slot(void) {
+  for (size_t i = 0; i < GH_MAX_BREAKPOINTS; ++i) {
+    if (!g_gh_guard_hooks[i].enabled) return &g_gh_guard_hooks[i];
+  }
+  return NULL;
+}
+
+gh_status gh_guard_hook_add(gh_guard_hook *hook, void *addr, size_t size, gh_guard_callback cb, void *user) {
+  if (!addr || size == 0 || !cb) return GH_ERR_INVALID_ARG;
+
+  gh_breakpoints_init_handler();
+
+  gh_guard_hook *slot = hook ? hook : gh_guard_hook_find_slot();
+  if (!slot) return GH_ERR_STATE;
+
+  MEMORY_BASIC_INFORMATION mbi;
+  if (VirtualQuery(addr, &mbi, sizeof(mbi)) != sizeof(mbi)) return GH_ERR_STATE;
+
+  DWORD oldp = 0;
+  if (!VirtualProtect(mbi.BaseAddress, mbi.RegionSize, mbi.Protect | PAGE_GUARD, &oldp)) {
+    return GH_ERR_PROTECT;
+  }
+
+  slot->addr = addr;
+  slot->size = size;
+  slot->callback = cb;
+  slot->user = user;
+  slot->enabled = 1;
+  return GH_OK;
+}
+
+gh_status gh_guard_hook_remove(gh_guard_hook *hook) {
+  if (!hook || !hook->enabled || !hook->addr) return GH_ERR_INVALID_ARG;
+
+  MEMORY_BASIC_INFORMATION mbi;
+  if (VirtualQuery(hook->addr, &mbi, sizeof(mbi)) != sizeof(mbi)) return GH_ERR_STATE;
+
+  DWORD oldp = 0;
+  VirtualProtect(mbi.BaseAddress, mbi.RegionSize, mbi.Protect & ~PAGE_GUARD, &oldp);
+  hook->enabled = 0;
+  return GH_OK;
+}
+#endif
 
 #if GH_ENABLE_HW_BREAKPOINTS
 #if GH_PLATFORM_WINDOWS
