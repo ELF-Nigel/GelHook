@@ -1084,7 +1084,6 @@ gh_status gh_plt_hook(const char *symbol_name, void *replacement, void **origina
 #endif
 
 #endif
-#endif
 
 /* ---------------- Breakpoint hooks (user-mode) ---------------- */
 
