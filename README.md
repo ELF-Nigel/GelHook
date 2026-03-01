@@ -39,6 +39,7 @@ cmake --build build --config Release
 - `examples/vtable.cpp` vtable swap (C++)
 - `examples/vtable_swap.cpp` deep-copy vtable swap (C++)
 - `examples/site_hook.c` site (mid-function) hook
+- `examples/manager.c` manager atomic enable
 - `examples/rehook.c` rehook stress test
 - `examples/python/` Python ctypes demo
 
