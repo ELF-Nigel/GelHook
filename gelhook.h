@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -91,6 +92,16 @@ typedef enum gh_status {
   GH_ERR_RANGE = -7,
   GH_ERR_NOT_FOUND = -8
 } gh_status;
+
+typedef enum gh_log_level {
+  GH_LOG_ERROR = 0,
+  GH_LOG_WARN = 1,
+  GH_LOG_INFO = 2,
+  GH_LOG_DEBUG = 3,
+  GH_LOG_TRACE = 4
+} gh_log_level;
+
+typedef void (*gh_log_fn)(gh_log_level level, const char *msg, void *user);
 
 typedef enum gh_hook_kind {
   GH_HOOK_INLINE = 0,
@@ -210,6 +221,8 @@ GELHOOK_API gh_status gh_rehook(gh_hook *hook);
 GELHOOK_API void *gh_get_trampoline(const gh_hook *hook);
 GELHOOK_API const char *gh_last_error(void);
 GELHOOK_API void gh_set_decoder(const gh_decoder *dec);
+GELHOOK_API void gh_set_log_level(gh_log_level level);
+GELHOOK_API void gh_set_logger(gh_log_fn fn, void *user);
 
 GELHOOK_API gh_status gh_manager_init(gh_hook_manager *mgr, size_t initial_cap);
 GELHOOK_API gh_status gh_manager_add(gh_hook_manager *mgr, const gh_hook *hook);
@@ -334,6 +347,9 @@ GELHOOK_API void gh_set_thread_callbacks(const gh_thread_callbacks *cbs);
 static char g_gh_last_error[128];
 static gh_thread_callbacks g_gh_thread_cbs;
 static gh_decoder g_gh_decoder;
+static gh_log_level g_gh_log_level = GH_LOG_INFO;
+static gh_log_fn g_gh_logger = NULL;
+static void *g_gh_logger_user = NULL;
 
 static void gh_set_error(const char *msg) {
   size_t n = strlen(msg);
@@ -344,6 +360,46 @@ static void gh_set_error(const char *msg) {
 
 const char *gh_last_error(void) {
   return g_gh_last_error;
+}
+
+static const char *gh_log_level_str(gh_log_level lvl) {
+  switch (lvl) {
+    case GH_LOG_ERROR: return "ERROR";
+    case GH_LOG_WARN: return "WARN";
+    case GH_LOG_INFO: return "INFO";
+    case GH_LOG_DEBUG: return "DEBUG";
+    case GH_LOG_TRACE: return "TRACE";
+    default: return "LOG";
+  }
+}
+
+static void gh_default_logger(gh_log_level lvl, const char *msg, void *user) {
+  (void)user;
+  fprintf(stderr, "[GelHook] %s: %s\n", gh_log_level_str(lvl), msg);
+}
+
+static void gh_log(gh_log_level lvl, const char *fmt, ...) {
+#ifndef GELHOOK_NO_LOG
+  if (lvl > g_gh_log_level) return;
+  char buf[512];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (g_gh_logger) g_gh_logger(lvl, buf, g_gh_logger_user);
+  else gh_default_logger(lvl, buf, NULL);
+#else
+  (void)lvl; (void)fmt;
+#endif
+}
+
+void gh_set_log_level(gh_log_level level) {
+  g_gh_log_level = level;
+}
+
+void gh_set_logger(gh_log_fn fn, void *user) {
+  g_gh_logger = fn;
+  g_gh_logger_user = user;
 }
 
 void gh_set_thread_callbacks(const gh_thread_callbacks *cbs) {
@@ -897,6 +953,7 @@ gh_status gh_init_hook_ex(gh_hook *hook, void *target, void *replacement, const 
   hook->target = target;
   hook->replacement = replacement;
 
+  gh_log(GH_LOG_DEBUG, "init hook target=%p replacement=%p", target, replacement);
   return gh_prepare_inline_hook(hook, options);
 }
 
@@ -922,6 +979,7 @@ gh_status gh_init_hook_at(gh_hook *hook, void *site, void *replacement, size_t p
   hook->replacement = replacement;
   hook->patch_size = patch_size;
 
+  gh_log(GH_LOG_DEBUG, "init site hook site=%p replacement=%p patch=%zu", site, replacement, patch_size);
   return gh_build_trampoline(hook, options);
 }
 
@@ -1018,6 +1076,7 @@ gh_status gh_enable_hook(gh_hook *hook) {
     return GH_ERR_STATE;
   }
 
+  gh_log(GH_LOG_INFO, "enable hook target=%p replacement=%p", hook->target, hook->replacement);
   gh_hook_options opts;
   opts.prefer_rel_jump = 1;
   opts.suspend_threads = 1;
@@ -1066,6 +1125,7 @@ gh_status gh_disable_hook(gh_hook *hook) {
     return GH_ERR_STATE;
   }
 
+  gh_log(GH_LOG_INFO, "disable hook target=%p", hook->target);
   if (hook->kind == GH_HOOK_HOTPATCH && hook->extra) {
     uint8_t *pre = (uint8_t *)hook->extra;
     int pre_old = 0;
@@ -1111,6 +1171,7 @@ gh_status gh_destroy_hook(gh_hook *hook) {
     gh_free_exec(hook->trampoline, hook->stolen_len + GH_ABS_JMP_SIZE);
     hook->trampoline = NULL;
   }
+  gh_log(GH_LOG_DEBUG, "destroy hook");
   return GH_OK;
 }
 
@@ -1276,6 +1337,7 @@ gh_status gh_iat_hook(const char *module_name, const char *import_dll,
                       const char *func_name, void *replacement, void **original_out) {
   HMODULE hmod = module_name ? GetModuleHandleA(module_name) : GetModuleHandleA(NULL);
   if (!hmod) return GH_ERR_NOT_FOUND;
+  gh_log(GH_LOG_INFO, "iat hook module=%s dll=%s func=%s", module_name ? module_name : "(self)", import_dll, func_name);
   return gh_iat_hook_module_internal(hmod, import_dll, func_name, replacement, original_out);
 }
 
@@ -1287,6 +1349,7 @@ gh_status gh_iat_hook_module(void *module_base, const char *import_dll,
 gh_status gh_iat_hook_all(const char *import_dll, const char *func_name,
                           void *replacement, void **original_out) {
   if (!import_dll || !func_name || !replacement) return GH_ERR_INVALID_ARG;
+  gh_log(GH_LOG_INFO, "iat hook all dll=%s func=%s", import_dll, func_name);
 
   HMODULE modules[512];
   DWORD needed = 0;
@@ -1308,6 +1371,7 @@ gh_status gh_eat_hook(const char *module_name, const char *export_name,
 
   HMODULE hmod = module_name ? GetModuleHandleA(module_name) : GetModuleHandleA(NULL);
   if (!hmod) return GH_ERR_NOT_FOUND;
+  gh_log(GH_LOG_INFO, "eat hook module=%s export=%s", module_name ? module_name : "(self)", export_name);
 
   ULONG size = 0;
   PIMAGE_EXPORT_DIRECTORY exp = (PIMAGE_EXPORT_DIRECTORY)ImageDirectoryEntryToData(
@@ -1435,6 +1499,7 @@ gh_status gh_delay_iat_hook(const char *module_name, const char *import_dll,
 
   HMODULE hmod = module_name ? GetModuleHandleA(module_name) : GetModuleHandleA(NULL);
   if (!hmod) return GH_ERR_NOT_FOUND;
+  gh_log(GH_LOG_INFO, "delay iat hook module=%s dll=%s func=%s", module_name ? module_name : "(self)", import_dll, func_name);
 
   ULONG size = 0;
   PIMAGE_DELAYLOAD_DESCRIPTOR desc = (PIMAGE_DELAYLOAD_DESCRIPTOR)ImageDirectoryEntryToData(
@@ -1887,6 +1952,7 @@ gh_status gh_guard_hook_add(gh_guard_hook *hook, void *addr, size_t size, gh_gua
   if (!addr || size == 0 || !cb) return GH_ERR_INVALID_ARG;
 
   gh_breakpoints_init_handler();
+  gh_log(GH_LOG_INFO, "guard hook addr=%p size=%zu", addr, size);
 
   gh_guard_hook *slot = hook ? hook : gh_guard_hook_find_slot();
   if (!slot) return GH_ERR_STATE;
@@ -1909,6 +1975,7 @@ gh_status gh_guard_hook_add(gh_guard_hook *hook, void *addr, size_t size, gh_gua
 
 gh_status gh_guard_hook_remove(gh_guard_hook *hook) {
   if (!hook || !hook->enabled || !hook->addr) return GH_ERR_INVALID_ARG;
+  gh_log(GH_LOG_INFO, "guard hook remove addr=%p", hook->addr);
 
   MEMORY_BASIC_INFORMATION mbi;
   if (VirtualQuery(hook->addr, &mbi, sizeof(mbi)) != sizeof(mbi)) return GH_ERR_STATE;
