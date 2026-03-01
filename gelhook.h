@@ -6,6 +6,12 @@
   MIT License
 */
 
+#if !defined(_WIN32) && !defined(_WIN64)
+  #ifndef _GNU_SOURCE
+    #define _GNU_SOURCE 1
+  #endif
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -242,6 +248,9 @@ GELHOOK_API void gh_set_thread_callbacks(const gh_thread_callbacks *cbs);
   #include <elf.h>
   #include <signal.h>
   #include <ucontext.h>
+#if defined(__linux__)
+  #include <sys/ucontext.h>
+#endif
 #endif
 
 #ifndef GH_MIN
