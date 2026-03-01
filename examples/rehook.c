@@ -11,6 +11,7 @@
 #define GELHOOK_IMPLEMENTATION
 #include "../gelhook.h"
 
+
 #if defined(_MSC_VER)
   #define GH_NOINLINE __declspec(noinline)
 #else
@@ -42,6 +43,7 @@ static void gh_make_writable(void *addr, size_t size) {
 }
 
 int main(void) {
+  gh_set_log_level(GH_LOG_DEBUG);
   gh_hook hook;
   if (gh_init_hook(&hook, (void *)target, (void *)replacement) != GH_OK) {
     printf("init failed: %s\n", gh_last_error());

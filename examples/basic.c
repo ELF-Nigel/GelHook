@@ -26,6 +26,7 @@ static int replacement(int x) {
 }
 
 int main(void) {
+  gh_set_log_level(GH_LOG_DEBUG);
   gh_hook hook;
   if (gh_init_hook(&hook, (void *)target, (void *)replacement) != GH_OK) {
     printf("init failed: %s\n", gh_last_error());

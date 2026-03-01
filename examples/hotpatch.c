@@ -3,6 +3,7 @@
 #define GELHOOK_IMPLEMENTATION
 #include "../gelhook.h"
 
+
 #if defined(_MSC_VER)
   #define GH_NOINLINE __declspec(noinline)
 #else
@@ -25,6 +26,7 @@ static int replacement(int x) {
 }
 
 int main(void) {
+  gh_set_log_level(GH_LOG_DEBUG);
   gh_hook hook;
   gh_hook_options opts = {1, 1, 1, 1, GH_MAX_STOLEN};
 

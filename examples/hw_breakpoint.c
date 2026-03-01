@@ -4,6 +4,7 @@
 #define GELHOOK_IMPLEMENTATION
 #include "../gelhook.h"
 
+
 static volatile LONG g_hits = 0;
 static HANDLE g_start_evt = NULL;
 
@@ -29,6 +30,7 @@ static DWORD WINAPI worker_thread(LPVOID param) {
 }
 
 int main(void) {
+  gh_set_log_level(GH_LOG_DEBUG);
   g_start_evt = CreateEventA(NULL, TRUE, FALSE, NULL);
   if (!g_start_evt) return 1;
 

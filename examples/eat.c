@@ -4,6 +4,7 @@
 #define GELHOOK_IMPLEMENTATION
 #include "../gelhook.h"
 
+
 __declspec(dllexport) int exported_add(int x) {
   return x + 3;
 }
@@ -13,6 +14,7 @@ static int replacement_add(int x) {
 }
 
 int main(void) {
+  gh_set_log_level(GH_LOG_DEBUG);
   void *orig = NULL;
   if (gh_eat_hook(NULL, "exported_add", (void *)replacement_add, &orig) != GH_OK) {
     printf("eat hook failed: %s\n", gh_last_error());

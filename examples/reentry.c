@@ -3,6 +3,7 @@
 #define GELHOOK_IMPLEMENTATION
 #include "../gelhook.h"
 
+
 typedef int (*target_fn)(int);
 static target_fn g_trampoline = NULL;
 static gh_reentry_guard g_guard = {1};
@@ -17,6 +18,7 @@ static int replacement(int x) {
 }
 
 int main(void) {
+  gh_set_log_level(GH_LOG_DEBUG);
   gh_hook hook;
   if (gh_init_hook(&hook, (void *)target, (void *)replacement) != GH_OK) {
     printf("init failed: %s\n", gh_last_error());

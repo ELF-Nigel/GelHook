@@ -3,6 +3,7 @@
 #define GELHOOK_IMPLEMENTATION
 #include "../gelhook.h"
 
+
 #if defined(_MSC_VER)
   #define GH_NOINLINE __declspec(noinline)
 #else
@@ -19,6 +20,7 @@ static void on_break(void *ip, void *user) {
 }
 
 int main(void) {
+  gh_set_log_level(GH_LOG_DEBUG);
   gh_breakpoint bp;
   if (gh_breakpoint_add(&bp, (void *)target, on_break, NULL) != GH_OK) {
     printf("bp add failed: %s\n", gh_last_error());

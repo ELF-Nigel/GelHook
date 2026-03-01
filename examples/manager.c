@@ -3,6 +3,7 @@
 #define GELHOOK_IMPLEMENTATION
 #include "../gelhook.h"
 
+
 static int a(int x) { return x + 1; }
 static int b(int x) { return x + 2; }
 
@@ -10,6 +11,7 @@ static int ra(int x) { return x + 10; }
 static int rb(int x) { return x + 20; }
 
 int main(void) {
+  gh_set_log_level(GH_LOG_DEBUG);
   gh_hook ha, hb;
   gh_hook_options opts = {1, 1, 1, 1, GH_MAX_STOLEN};
 

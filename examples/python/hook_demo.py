@@ -1,6 +1,7 @@
-import ctypes
 import os
 import sys
+import subprocess
+import ctypes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -13,10 +14,31 @@ else:
 
 libpath = os.path.join(HERE, libname)
 
+
+def build_library():
+    print("Building demo library...")
+    if sys.platform.startswith("win"):
+        # Prefer MSVC if available
+        cl = os.environ.get("CL", None)
+        if cl is not None:
+            cmd = ["cl", "/LD", "/O2", "/Fe:" + libname, "hook_lib.c"]
+            subprocess.check_call(cmd, cwd=HERE)
+        else:
+            # Try clang-cl
+            cmd = ["clang-cl", "/LD", "/O2", "/Fe:" + libname, "hook_lib.c"]
+            subprocess.check_call(cmd, cwd=HERE)
+    else:
+        cmd = ["cc", "-shared", "-fPIC", "-O2", "-o", libname, "hook_lib.c"]
+        subprocess.check_call(cmd, cwd=HERE)
+
+
 if not os.path.exists(libpath):
-    print("Shared library not found:", libpath)
-    print("Build it first. See examples/python/README.md")
-    sys.exit(1)
+    try:
+        build_library()
+    except Exception as e:
+        print("Build failed:", e)
+        print("See examples/python/README.md for manual build steps.")
+        sys.exit(1)
 
 lib = ctypes.CDLL(libpath)
 lib.ghpy_call.argtypes = [ctypes.c_int]

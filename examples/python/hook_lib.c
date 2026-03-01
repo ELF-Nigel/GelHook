@@ -11,6 +11,10 @@
 #include "../../gelhook.h"
 
 #if defined(_MSC_VER)
+  #pragma comment(lib, "dbghelp.lib")
+#endif
+
+#if defined(_MSC_VER)
   #define GH_NOINLINE __declspec(noinline)
 #else
   #define GH_NOINLINE __attribute__((noinline))
