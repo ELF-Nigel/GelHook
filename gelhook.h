@@ -98,7 +98,8 @@ typedef enum gh_hook_kind {
   GH_HOOK_PLT = 2,
   GH_HOOK_VTABLE = 3,
   GH_HOOK_SITE = 4,
-  GH_HOOK_EAT = 5
+  GH_HOOK_EAT = 5,
+  GH_HOOK_HOTPATCH = 6
 } gh_hook_kind;
 
 typedef struct gh_hook_options {
@@ -201,6 +202,7 @@ typedef struct gh_hw_breakpoint {
 GELHOOK_API gh_status gh_init_hook(gh_hook *hook, void *target, void *replacement);
 GELHOOK_API gh_status gh_init_hook_ex(gh_hook *hook, void *target, void *replacement, const gh_hook_options *options);
 GELHOOK_API gh_status gh_init_hook_at(gh_hook *hook, void *site, void *replacement, size_t patch_size, const gh_hook_options *options);
+GELHOOK_API gh_status gh_init_hotpatch_hook(gh_hook *hook, void *target, void *replacement, const gh_hook_options *options);
 GELHOOK_API gh_status gh_enable_hook(gh_hook *hook);
 GELHOOK_API gh_status gh_disable_hook(gh_hook *hook);
 GELHOOK_API gh_status gh_destroy_hook(gh_hook *hook);
@@ -246,9 +248,21 @@ GELHOOK_API gh_status gh_eat_hook_module(void *module_base, const char *export_n
                                          void *replacement, void **original_out);
 GELHOOK_API void *gh_resolve_export_forwarder(void *module_base, const char *export_name);
 GELHOOK_API void *gh_resolve_export_by_ordinal(void *module_base, uint16_t ordinal);
+GELHOOK_API gh_status gh_tls_callback_hook(const char *module_name, size_t index,
+                                           void *replacement, void **original_out);
+GELHOOK_API void *gh_find_code_cave_module(void *module_base, size_t size);
 #endif
 
 GELHOOK_API void *gh_resolve_symbol(const char *module_name, const char *symbol_name);
+
+typedef struct gh_module_info {
+  void *base;
+  size_t size;
+  const char *name;
+} gh_module_info;
+
+typedef int (*gh_module_enum_cb)(const gh_module_info *info, void *user);
+GELHOOK_API int gh_enum_modules(gh_module_enum_cb cb, void *user);
 
 #if GH_ENABLE_BREAKPOINTS
 GELHOOK_API gh_status gh_breakpoint_add(gh_breakpoint *bp, void *addr, gh_bp_callback cb, void *user);
@@ -280,6 +294,8 @@ GELHOOK_API void gh_set_thread_callbacks(const gh_thread_callbacks *cbs);
   #include <psapi.h>
   #include <dbghelp.h>
   #include <delayimp.h>
+  #include <winternl.h>
+  #include <intrin.h>
 #else
   #include <sys/mman.h>
   #include <unistd.h>
@@ -484,6 +500,33 @@ static void *gh_alloc_exec_near(void *target, size_t size) {
   }
   return NULL;
 #endif
+}
+
+static void *gh_find_code_cave_module(void *module_base, size_t size) {
+#if GH_PLATFORM_WINDOWS
+  if (!module_base || size == 0) return NULL;
+  uint8_t *base = (uint8_t *)module_base;
+  IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE) return NULL;
+  IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+  IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+  for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+    DWORD chars = sec[i].Characteristics;
+    if ((chars & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
+    uint8_t *start = base + sec[i].VirtualAddress;
+    size_t len = (size_t)sec[i].Misc.VirtualSize;
+    for (size_t off = 0; off + size <= len; ++off) {
+      size_t j = 0;
+      for (; j < size; ++j) {
+        uint8_t b = start[off + j];
+        if (b != 0x90 && b != 0xCC) break;
+      }
+      if (j == size) return start + off;
+    }
+  }
+#endif
+  (void)module_base; (void)size;
+  return NULL;
 }
 
 /* ---------------- Minimal x86-64 instruction decoder ---------------- */
@@ -806,6 +849,11 @@ static gh_status gh_prepare_inline_hook(gh_hook *hook, const gh_hook_options *op
   } else {
     if (allow_cave) {
       cave = gh_find_code_cave(hook->target, GH_ABS_JMP_SIZE);
+#if GH_PLATFORM_WINDOWS
+      if (!cave) {
+        cave = gh_find_code_cave_module(GetModuleHandleA(NULL), GH_ABS_JMP_SIZE);
+      }
+#endif
       if (cave && gh_rel32_fits(hook->target, cave, GH_REL_JMP_SIZE)) {
         hook->patch_size = GH_REL_JMP_SIZE;
         hook->extra = cave;
@@ -859,10 +907,62 @@ gh_status gh_init_hook_at(gh_hook *hook, void *site, void *replacement, size_t p
   return gh_build_trampoline(hook, options);
 }
 
+gh_status gh_init_hotpatch_hook(gh_hook *hook, void *target, void *replacement, const gh_hook_options *options) {
+  if (!hook || !target || !replacement) {
+    gh_set_error("invalid args");
+    return GH_ERR_INVALID_ARG;
+  }
+
+  uint8_t *t = (uint8_t *)target;
+  uint8_t *pre = t - 5;
+  if (!((t[0] == 0x8B && t[1] == 0xFF) || (t[0] == 0x90 && t[1] == 0x90))) {
+    gh_set_error("hotpatch requires 2-byte prologue");
+    return GH_ERR_UNSUPPORTED;
+  }
+
+  for (int i = 0; i < 5; ++i) {
+    if (pre[i] != 0x90 && pre[i] != 0xCC) {
+      gh_set_error("hotpatch slot missing");
+      return GH_ERR_UNSUPPORTED;
+    }
+  }
+
+  memset(hook, 0, sizeof(*hook));
+  hook->kind = GH_HOOK_HOTPATCH;
+  hook->target = target;
+  hook->replacement = replacement;
+  hook->patch_size = 2;
+  hook->extra = pre;
+
+  memcpy(hook->original, t, 2);
+  memcpy(hook->original + 2, pre, 5);
+  hook->stolen_len = 2;
+
+  return gh_build_trampoline(hook, options);
+}
+
 static gh_status gh_apply_patch(gh_hook *hook) {
   int old_prot = 0;
   gh_status st = gh_protect_rwxa(hook->target, hook->patch_size, &old_prot);
   if (st != GH_OK) return st;
+
+  if (hook->kind == GH_HOOK_HOTPATCH && hook->extra) {
+    uint8_t *pre = (uint8_t *)hook->extra;
+    int pre_old = 0;
+    gh_status stp = gh_protect_rwxa(pre, GH_ABS_JMP_SIZE, &pre_old);
+    if (stp != GH_OK) return stp;
+    gh_write_abs_jump(pre, hook->replacement, pre);
+    (void)gh_restore_prot(pre, GH_ABS_JMP_SIZE, pre_old);
+
+    uint8_t patch[2];
+    patch[0] = 0xEB;
+    patch[1] = (uint8_t)(-7);
+    memcpy(hook->target, patch, 2);
+
+    st = gh_restore_prot(hook->target, hook->patch_size, old_prot);
+    if (st != GH_OK) return st;
+    return GH_OK;
+  }
 
   if (hook->patch_size == GH_REL_JMP_SIZE) {
     unsigned char patch[GH_REL_JMP_SIZE];
@@ -920,6 +1020,10 @@ gh_status gh_rehook(gh_hook *hook) {
   if (!hook || !hook->target) return GH_ERR_INVALID_ARG;
   if (!hook->enabled) return GH_ERR_STATE;
 
+  if (hook->kind == GH_HOOK_HOTPATCH) {
+    return gh_apply_patch(hook);
+  }
+
   if (hook->patch_size == GH_REL_JMP_SIZE) {
     unsigned char expected[GH_REL_JMP_SIZE];
     void *dst = hook->extra ? hook->extra : hook->replacement;
@@ -942,6 +1046,25 @@ gh_status gh_disable_hook(gh_hook *hook) {
   if (!hook->enabled) {
     gh_set_error("not enabled");
     return GH_ERR_STATE;
+  }
+
+  if (hook->kind == GH_HOOK_HOTPATCH && hook->extra) {
+    uint8_t *pre = (uint8_t *)hook->extra;
+    int pre_old = 0;
+    gh_status stp = gh_protect_rwxa(pre, 5, &pre_old);
+    if (stp != GH_OK) return stp;
+    memcpy(pre, hook->original + 2, 5);
+    (void)gh_restore_prot(pre, 5, pre_old);
+
+    int old_prot_hp = 0;
+    gh_status st_hp = gh_protect_rwxa(hook->target, 2, &old_prot_hp);
+    if (st_hp != GH_OK) return st_hp;
+    memcpy(hook->target, hook->original, 2);
+    st_hp = gh_restore_prot(hook->target, 2, old_prot_hp);
+    if (st_hp != GH_OK) return st_hp;
+
+    hook->enabled = 0;
+    return GH_OK;
   }
 
   int old_prot = 0;
@@ -1328,6 +1451,35 @@ gh_status gh_delay_iat_hook(const char *module_name, const char *import_dll,
   }
 
   return GH_ERR_NOT_FOUND;
+}
+
+gh_status gh_tls_callback_hook(const char *module_name, size_t index,
+                               void *replacement, void **original_out) {
+  if (!replacement) return GH_ERR_INVALID_ARG;
+
+  HMODULE hmod = module_name ? GetModuleHandleA(module_name) : GetModuleHandleA(NULL);
+  if (!hmod) return GH_ERR_NOT_FOUND;
+
+  ULONG size = 0;
+  PIMAGE_TLS_DIRECTORY64 tls = (PIMAGE_TLS_DIRECTORY64)ImageDirectoryEntryToData(
+      hmod, TRUE, IMAGE_DIRECTORY_ENTRY_TLS, &size);
+  if (!tls || !tls->AddressOfCallBacks) return GH_ERR_NOT_FOUND;
+
+  PVOID *callbacks = (PVOID *)(uintptr_t)tls->AddressOfCallBacks;
+  if (!callbacks[index]) return GH_ERR_NOT_FOUND;
+
+  if (original_out) *original_out = callbacks[index];
+
+  int old_prot = 0;
+  gh_status st = gh_protect_rwxa(&callbacks[index], sizeof(void *), &old_prot);
+  if (st != GH_OK) return st;
+
+  callbacks[index] = replacement;
+
+  st = gh_restore_prot(&callbacks[index], sizeof(void *), old_prot);
+  if (st != GH_OK) return st;
+
+  return GH_OK;
 }
 
 gh_status gh_eat_hook_module(void *module_base, const char *export_name,
@@ -1879,6 +2031,34 @@ void *gh_resolve_symbol(const char *module_name, const char *symbol_name) {
   void *sym = dlsym(handle, symbol_name);
   if (module_name && handle && handle != RTLD_DEFAULT) dlclose(handle);
   return sym;
+#endif
+}
+
+int gh_enum_modules(gh_module_enum_cb cb, void *user) {
+  if (!cb) return 0;
+#if GH_PLATFORM_WINDOWS
+#if defined(_M_X64)
+  PPEB peb = (PPEB)__readgsqword(0x60);
+#elif defined(_M_IX86)
+  PPEB peb = (PPEB)__readfsdword(0x30);
+#else
+  PPEB peb = NULL;
+#endif
+  if (!peb || !peb->Ldr) return 0;
+
+  LIST_ENTRY *head = &peb->Ldr->InMemoryOrderModuleList;
+  for (LIST_ENTRY *e = head->Flink; e != head; e = e->Flink) {
+    LDR_DATA_TABLE_ENTRY *ent = CONTAINING_RECORD(e, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+    gh_module_info info;
+    info.base = ent->DllBase;
+    info.size = (size_t)ent->SizeOfImage;
+    info.name = ent->FullDllName.Buffer ? (const char *)ent->FullDllName.Buffer : NULL;
+    if (!cb(&info, user)) break;
+  }
+  return 1;
+#else
+  (void)user;
+  return 0;
 #endif
 }
 

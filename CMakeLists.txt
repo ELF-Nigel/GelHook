@@ -50,6 +50,9 @@ if (GELHOOK_BUILD_EXAMPLES)
 
     add_executable(gh_example_guard examples/guard_page.c)
     target_link_libraries(gh_example_guard PRIVATE gelhook dbghelp)
+
+    add_executable(gh_example_hotpatch examples/hotpatch.c)
+    target_link_libraries(gh_example_hotpatch PRIVATE gelhook dbghelp)
   else()
     add_executable(gh_example_plt examples/plt.c)
     target_link_libraries(gh_example_plt PRIVATE gelhook dl)
