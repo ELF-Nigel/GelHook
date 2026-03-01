@@ -24,7 +24,6 @@ def build_library():
             cmd = ["cl", "/LD", "/O2", "/Fe:" + libname, "hook_lib.c"]
             subprocess.check_call(cmd, cwd=HERE)
         else:
-            # Try clang-cl
             cmd = ["clang-cl", "/LD", "/O2", "/Fe:" + libname, "hook_lib.c"]
             subprocess.check_call(cmd, cwd=HERE)
     else:
@@ -41,18 +40,48 @@ if not os.path.exists(libpath):
         sys.exit(1)
 
 lib = ctypes.CDLL(libpath)
-lib.ghpy_call.argtypes = [ctypes.c_int]
-lib.ghpy_call.restype = ctypes.c_int
-lib.ghpy_install_hook.argtypes = []
-lib.ghpy_install_hook.restype = ctypes.c_int
-lib.ghpy_uninstall_hook.argtypes = []
-lib.ghpy_uninstall_hook.restype = ctypes.c_int
 
-print("Before hook:", lib.ghpy_call(5))
+lib.ghpy_init.argtypes = [ctypes.c_int]
+lib.ghpy_init.restype = None
 
-rc = lib.ghpy_install_hook()
-print("Install hook rc:", rc)
+lib.ghpy_call_a.argtypes = [ctypes.c_int]
+lib.ghpy_call_a.restype = ctypes.c_int
 
-print("After hook:", lib.ghpy_call(5))
+lib.ghpy_call_b.argtypes = [ctypes.c_int]
+lib.ghpy_call_b.restype = ctypes.c_int
 
-lib.ghpy_uninstall_hook()
+lib.ghpy_install_inline.argtypes = []
+lib.ghpy_install_inline.restype = ctypes.c_int
+
+lib.ghpy_install_site.argtypes = []
+lib.ghpy_install_site.restype = ctypes.c_int
+
+lib.ghpy_rehook_inline.argtypes = []
+lib.ghpy_rehook_inline.restype = ctypes.c_int
+
+lib.ghpy_uninstall_all.argtypes = []
+lib.ghpy_uninstall_all.restype = ctypes.c_int
+
+# Enable TRACE logging
+lib.ghpy_init(4)
+
+print("== Advanced Python Hook Demo ==")
+
+print("A before:", lib.ghpy_call_a(5))
+print("B before:", lib.ghpy_call_b(5))
+
+rc = lib.ghpy_install_inline()
+print("Install inline hook rc:", rc)
+print("A after inline:", lib.ghpy_call_a(5))
+
+rc = lib.ghpy_install_site()
+print("Install site hook rc:", rc)
+print("B after site:", lib.ghpy_call_b(5))
+
+rc = lib.ghpy_rehook_inline()
+print("Rehook inline rc:", rc)
+print("A after rehook:", lib.ghpy_call_a(5))
+
+lib.ghpy_uninstall_all()
+print("A after uninstall:", lib.ghpy_call_a(5))
+print("B after uninstall:", lib.ghpy_call_b(5))
