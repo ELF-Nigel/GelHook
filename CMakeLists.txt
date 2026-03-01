@@ -22,11 +22,16 @@ if (GELHOOK_BUILD_EXAMPLES)
   target_link_libraries(gh_example_vtable PRIVATE gelhook)
 
   if (WIN32)
+    target_link_libraries(gh_example_basic PRIVATE dbghelp)
+    target_link_libraries(gh_example_bp PRIVATE dbghelp)
+    target_link_libraries(gh_example_rehook PRIVATE dbghelp)
+    target_link_libraries(gh_example_vtable PRIVATE dbghelp)
+
     add_executable(gh_example_iat examples/iat.c)
     target_link_libraries(gh_example_iat PRIVATE gelhook dbghelp)
 
     add_executable(gh_example_hw_bp examples/hw_breakpoint.c)
-    target_link_libraries(gh_example_hw_bp PRIVATE gelhook)
+    target_link_libraries(gh_example_hw_bp PRIVATE gelhook dbghelp)
   else()
     add_executable(gh_example_plt examples/plt.c)
     target_link_libraries(gh_example_plt PRIVATE gelhook dl)
