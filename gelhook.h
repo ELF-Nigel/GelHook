@@ -1,5 +1,4 @@
-#ifndef GELHOOK_H
-#define GELHOOK_H
+#pragma once
 
 /*
   GelHook - single-header x86_64 user-mode hook library (pure C)
@@ -1488,5 +1487,3 @@ static void gh_threads_resume_if_enabled(const gh_hook_options *opts) {
 }
 
 #endif /* GELHOOK_IMPLEMENTATION */
-
-#endif /* GELHOOK_H */
