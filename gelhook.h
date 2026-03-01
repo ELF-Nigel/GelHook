@@ -1300,7 +1300,6 @@ gh_status gh_iat_hook_all(const char *import_dll, const char *func_name,
   }
   return GH_ERR_NOT_FOUND;
 }
-}
 
 #if GH_PLATFORM_WINDOWS
 gh_status gh_eat_hook(const char *module_name, const char *export_name,
@@ -2069,7 +2068,16 @@ int gh_enum_modules(gh_module_enum_cb cb, void *user) {
     LDR_DATA_TABLE_ENTRY *ent = CONTAINING_RECORD(e, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
     gh_module_info info;
     info.base = ent->DllBase;
-    info.size = (size_t)ent->SizeOfImage;
+    info.size = 0;
+    if (ent->DllBase) {
+      IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)ent->DllBase;
+      if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+        IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((uint8_t *)ent->DllBase + dos->e_lfanew);
+        if (nt->Signature == IMAGE_NT_SIGNATURE) {
+          info.size = (size_t)nt->OptionalHeader.SizeOfImage;
+        }
+      }
+    }
     info.name = ent->FullDllName.Buffer ? (const char *)ent->FullDllName.Buffer : NULL;
     if (!cb(&info, user)) break;
   }
