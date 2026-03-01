@@ -209,7 +209,6 @@ GELHOOK_API gh_status gh_vtable_hook(void **vtable, size_t index, void *replacem
 GELHOOK_API gh_status gh_iat_hook(const char *module_name, const char *import_dll,
                                  const char *func_name, void *replacement, void **original_out);
 #endif
-#endif
 
 #if GH_ENABLE_PLT
 GELHOOK_API gh_status gh_plt_hook(const char *symbol_name, void *replacement, void **original_out);
