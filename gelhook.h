@@ -264,6 +264,24 @@ typedef struct gh_module_info {
 typedef int (*gh_module_enum_cb)(const gh_module_info *info, void *user);
 GELHOOK_API int gh_enum_modules(gh_module_enum_cb cb, void *user);
 
+typedef struct gh_export_info {
+  const char *name;
+  uint16_t ordinal;
+  void *address;
+  int is_forwarder;
+  const char *forwarder;
+} gh_export_info;
+
+typedef int (*gh_export_enum_cb)(const gh_export_info *info, void *user);
+GELHOOK_API int gh_enum_exports(void *module_base, gh_export_enum_cb cb, void *user);
+
+typedef struct gh_reentry_guard {
+  int max_depth;
+} gh_reentry_guard;
+
+GELHOOK_API int gh_reentry_enter(const gh_reentry_guard *guard);
+GELHOOK_API void gh_reentry_leave(const gh_reentry_guard *guard);
+
 #if GH_ENABLE_BREAKPOINTS
 GELHOOK_API gh_status gh_breakpoint_add(gh_breakpoint *bp, void *addr, gh_bp_callback cb, void *user);
 GELHOOK_API gh_status gh_breakpoint_remove(gh_breakpoint *bp);
@@ -2060,6 +2078,94 @@ int gh_enum_modules(gh_module_enum_cb cb, void *user) {
   (void)user;
   return 0;
 #endif
+}
+
+int gh_enum_exports(void *module_base, gh_export_enum_cb cb, void *user) {
+  if (!module_base || !cb) return 0;
+#if GH_PLATFORM_WINDOWS
+  HMODULE hmod = (HMODULE)module_base;
+  ULONG size = 0;
+  PIMAGE_EXPORT_DIRECTORY exp = (PIMAGE_EXPORT_DIRECTORY)ImageDirectoryEntryToData(
+      hmod, TRUE, IMAGE_DIRECTORY_ENTRY_EXPORT, &size);
+  if (!exp) return 0;
+
+  DWORD *names = (DWORD *)((uint8_t *)hmod + exp->AddressOfNames);
+  WORD *ords = (WORD *)((uint8_t *)hmod + exp->AddressOfNameOrdinals);
+  DWORD *funcs = (DWORD *)((uint8_t *)hmod + exp->AddressOfFunctions);
+
+  uint8_t *exp_start = (uint8_t *)exp;
+  uint8_t *exp_end = exp_start + size;
+
+  for (DWORD i = 0; i < exp->NumberOfNames; ++i) {
+    const char *name = (const char *)((uint8_t *)hmod + names[i]);
+    WORD ord = ords[i];
+    DWORD rva = funcs[ord];
+    uint8_t *addr = (uint8_t *)hmod + rva;
+
+    gh_export_info info;
+    info.name = name;
+    info.ordinal = (uint16_t)(exp->Base + ord);
+    info.address = addr;
+    info.is_forwarder = (addr >= exp_start && addr < exp_end) ? 1 : 0;
+    info.forwarder = info.is_forwarder ? (const char *)addr : NULL;
+
+    if (!cb(&info, user)) break;
+  }
+  return 1;
+#else
+  (void)user;
+  return 0;
+#endif
+}
+
+typedef struct gh_reentry_slot {
+  const gh_reentry_guard *guard;
+  int depth;
+} gh_reentry_slot;
+
+#if GH_PLATFORM_WINDOWS
+static DWORD g_gh_reentry_tls = TLS_OUT_OF_INDEXES;
+#else
+static __thread gh_reentry_slot g_gh_reentry_slots[8];
+#endif
+
+static gh_reentry_slot *gh_reentry_find_slot(const gh_reentry_guard *guard) {
+#if GH_PLATFORM_WINDOWS
+  if (g_gh_reentry_tls == TLS_OUT_OF_INDEXES) g_gh_reentry_tls = TlsAlloc();
+  gh_reentry_slot *slots = (gh_reentry_slot *)TlsGetValue(g_gh_reentry_tls);
+  if (!slots) {
+    slots = (gh_reentry_slot *)calloc(8, sizeof(gh_reentry_slot));
+    TlsSetValue(g_gh_reentry_tls, slots);
+  }
+#else
+  gh_reentry_slot *slots = g_gh_reentry_slots;
+#endif
+
+  gh_reentry_slot *empty = NULL;
+  for (int i = 0; i < 8; ++i) {
+    if (slots[i].guard == guard) return &slots[i];
+    if (!slots[i].guard && !empty) empty = &slots[i];
+  }
+  return empty;
+}
+
+int gh_reentry_enter(const gh_reentry_guard *guard) {
+  if (!guard) return 1;
+  gh_reentry_slot *slot = gh_reentry_find_slot(guard);
+  if (!slot) return 0;
+  int maxd = guard->max_depth ? guard->max_depth : 1;
+  if (slot->depth >= maxd) return 0;
+  slot->guard = guard;
+  slot->depth += 1;
+  return 1;
+}
+
+void gh_reentry_leave(const gh_reentry_guard *guard) {
+  if (!guard) return;
+  gh_reentry_slot *slot = gh_reentry_find_slot(guard);
+  if (!slot) return;
+  if (slot->depth > 0) slot->depth -= 1;
+  if (slot->depth == 0) slot->guard = NULL;
 }
 
 #endif

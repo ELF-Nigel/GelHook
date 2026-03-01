@@ -12,8 +12,10 @@ GelHook is a single-header, advanced user-mode hook library written in pure C fo
 - Rehook support (repair overwritten detours)
 - Windows IAT/EAT hooks + delay-load IAT + Linux PLT/GOT hooks
 - Module-scoped IAT/EAT utilities and export forwarder resolution
+- Export enumeration helpers (Windows)
 - TLS callback hook helper (Windows)
 - Module enumeration (Windows PEB) and code-cave scanners
+- Thread-local reentrancy guards
 - VTable/VFunc pointer swaps + deep-copy VTable swap
 - Mid-function/site hooks (patch arbitrary address)
 - User-mode software breakpoint hooks
@@ -47,6 +49,7 @@ cmake --build build --config Release
 - `examples/vtable_swap.cpp` deep-copy vtable swap (C++)
 - `examples/site_hook.c` site (mid-function) hook
 - `examples/manager.c` manager atomic enable
+- `examples/reentry.c` reentrancy guard
 - `examples/rehook.c` rehook stress test
 - `examples/python/` Python ctypes demo
 
